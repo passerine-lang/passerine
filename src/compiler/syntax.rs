@@ -1,25 +1,70 @@
 use std::fmt;
 use crate::common::span::Span;
 
-// TODO: rename to Static?
-/// Represents a static error (syntax, semantics, etc.) found at compile time
+/// Represents a note attached to a Syntax error,
+/// i.e. a location in source code with an optional
+/// specific hint or tip.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Note {
+    pub span: Span,
+    pub hint: Option<String>,
+}
+
+/// Represents a static error (syntax, semantics, etc.) found at compile time.
+/// Ideally, each note included should have a distinct `Span` and hint.
+/// Usually, one `Note` for an error is enough.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Syntax {
-    pub message: String,
-    pub span:    Span,
+    pub reason: String,
+    pub notes:  Vec<Note>,
 }
 
 impl Syntax {
-    /// Creates a new static error.
-    pub fn error(message: &str, span: &Span) -> Syntax {
-        Syntax { message: message.to_string(), span: span.clone() }
+    /// Creates a new static error, with
+    pub fn error(reason: &str, span: &Span) -> Syntax {
+        Syntax::error_with_note(reason, Note { span: span.clone(), hint: None })
+    }
+
+    /// Creates a new static error, but with an added hint.
+    pub fn error_with_note(reason: &str, note: Note) -> Syntax {
+        Syntax {
+            reason: reason.to_string(),
+            notes:  vec![note],
+        }
+    }
+
+    pub fn add_note(&mut self, note: Note) {
+        self.notes.push(note)
     }
 }
 
 impl fmt::Display for Syntax {
     fn fmt (&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if !self.span.is_empty() { fmt::Display::fmt(&self.span, f)? };
-        write!(f, "Syntax Error: {}", self.message)
+        for note in self.notes.iter() {
+            let formatted = note.span.format();
+
+            if let Some(ref hint) = note.hint {
+                if formatted.is_multiline() {
+                    writeln!(f, "{}", formatted)?;
+                    writeln!(f, "{} ├─ note: {} ", formatted.gutter_padding(), hint)?;
+                    writeln!(f, "{} │", " ".repeat(formatted.gutter_padding()))?;
+                } else {
+                    writeln!(f, "In {}:{}:{}", formatted.path, formatted.start, formatted.start_col)?;
+                    writeln!(f, "{} │", " ".repeat(formatted.gutter_padding()))?;
+                    writeln!(f, "{} │ {}", formatted.start + 1, formatted.lines[0])?;
+                    writeln!(f, "{} │ {}{} note: {}",
+                        " ".repeat(formatted.gutter_padding()),
+                        " ".repeat(formatted.start_col),
+                        "^".repeat(formatted.carrots().unwrap()),
+                        hint,
+                    )?;
+                    writeln!(f, "{} │", " ".repeat(formatted.gutter_padding()))?;
+                }
+            } else {
+                write!(f, "{}", formatted)?;
+            }
+        }
+        write!(f, "Syntax Error: {}", self.reason)
     }
 }
 

@@ -15,6 +15,11 @@ use crate::vm::{
     stack::Stack,
 };
 
+// TODO: algebraic effects
+// more than just Trace, Runtime - mechanism for raising effects
+// fiber scheduling environment handles FFI, no more holding refs to rust functions.
+// TODO: convert VM to Fiber
+
 /// A `VM` executes bytecode lambda closures.
 /// (That's a mouthful - think bytecode + some context).
 /// VM initialization overhead is tiny,
@@ -108,6 +113,7 @@ impl VM {
             Opcode::UnData  => self.un_data(),
             Opcode::UnLabel => self.un_label(),
             Opcode::UnTuple => self.un_tuple(),
+            Opcode::Noop    => self.done(),
         }
     }
 
@@ -152,14 +158,6 @@ impl VM {
 
         return result;
     }
-
-    // TODO: there are a lot of optimizations that can be made
-    // I'll list a few here:
-    // - searching the stack for variables
-    //   A global Hash-table has significantly less overhead for function calls
-    // - cloning the heck out of everything - useless copies
-    //   instead, lifetime analysis during compilation
-    // - replace some panics with Result<()>s
 
     /// Load a constant and push it onto the stack.
     #[inline]
@@ -272,7 +270,7 @@ impl VM {
             _ => unreachable!(),
         };
         let data = self.stack.pop_data();
-        self.stack.push_data(Data::Label(Box::new(kind), Box::new(data)));
+        self.stack.push_data(Data::Label(kind, Box::new(data)));
         self.done()
     }
 
@@ -311,7 +309,7 @@ impl VM {
         };
 
         let d = match self.stack.pop_data() {
-            Data::Label(n, d) if *n == kind => d,
+            Data::Label(n, d) if n == kind => d,
             other => return Err(Trace::error(
                 "Pattern Matching",
                 &format!("The data '{}' does not match the Label '{}'", other, kind),
@@ -474,26 +472,15 @@ impl VM {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::compiler::{
-        lex::lex,
-        parse::parse,
-        desugar::desugar,
-        hoist::hoist,
-        gen::gen,
-    };
+    use crate::compile;
     use crate::common::source::Source;
 
     fn inspect(source: &str) -> VM {
-        let lambda = lex(Source::source(source))
-            .and_then(parse)
-            .and_then(desugar)
-            .and_then(hoist)
-            .and_then(gen)
+        let closure = compile(Source::source(source))
             .map_err(|e| println!("{}", e))
             .unwrap();
 
-        // println!("{:?}", lambda);
-        let mut vm = VM::init(Closure::wrap(lambda));
+        let mut vm = VM::init(closure);
 
         match vm.run() {
             Ok(()) => vm,

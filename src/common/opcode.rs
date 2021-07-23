@@ -34,14 +34,17 @@ pub enum Opcode {
     Print,
     /// Constructs a label.
     Label,
-    // Constructs a tuple.
+    /// Constructs a tuple.
     Tuple,
     /// Destructures atomic data by asserting it matches exactly.
     UnData,
+    // TODO: make unlabel take the label index as an arg.
     /// Destructures a label.
     UnLabel,
-    /// Sestructures a tuple.
+    /// Destructures a tuple.
     UnTuple,
+    /// Does nothing. Must always be last.
+    Noop,
 }
 
 impl Opcode {
@@ -53,5 +56,18 @@ impl Opcode {
     /// so it'll be pretty obvious.
     pub fn from_byte(byte: u8) -> Opcode {
         unsafe { std::mem::transmute(byte) }
+    }
+
+    /// Convert a raw byte to an opcode.
+    /// Performing a bounds check first.
+    /// Used for bytecode verification,
+    /// Do not use in a hot loop.
+    pub fn from_byte_safe(byte: u8) -> Option<Opcode> {
+        // safety: we do a bounds check on the byte
+        if byte <= Opcode::Noop as u8 {
+            Some(Opcode::from_byte(byte))
+        } else {
+            None
+        }
     }
 }

@@ -14,22 +14,12 @@
 //! Note that more steps (e.g. ones applying typechecking operations, optimization passes, etc.)
 //! may be implemented in the future.
 
+// TODO: wrap ast in module
+
 pub mod lex;
 pub mod parse;
-pub mod desugar;
-pub mod hoist;
-pub mod gen;
-
-pub mod token;
-pub mod ast; // high level pre-macro IR
-pub mod rule; // macro transformation
-pub mod cst; // post-macro IR
-pub mod sst; // hoisted IR
+// pub mod hoist;
+// pub mod gen;
 
 pub mod syntax;
-
-pub use lex::lex;
-pub use parse::parse;
-pub use desugar::desugar;
-pub use hoist::hoist;
-pub use gen::gen;
+pub mod lower;

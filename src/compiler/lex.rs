@@ -6,45 +6,31 @@ use std::{
 
 use crate::common::{
     source::Source,
-    span::{ Span, Spanned },
+    span::{Span, Spanned},
     data::Data,
 };
 
+use crate::construct::{
+    module::ThinModule,
+    token::{Delim, Token, Tokens},
+};
+
 use crate::compiler::{
-    token::Token,
-    syntax::Syntax,
+    lower::Lower,
+    syntax::{Syntax, Note},
 };
 
 type Bite = (Token, usize);
 
-/// A static token.
-/// This _must_ be sorted by length.
-pub const STATIC_TOKENS: &[(&str, Token)] = &[
-    ("syntax", Token::Syntax),
-    ("magic", Token::Magic),
-    ("()", Token::Unit),
-    ("->", Token::Lambda),
-    ("==", Token::Equal),
-    ("**", Token::Pow),
-    ("{", Token::OpenBracket),
-    ("}", Token::CloseBracket),
-    ("(", Token::OpenParen),
-    (")", Token::CloseParen),
-    ("=", Token::Assign),
-    (".", Token::Compose),
-    (",", Token::Pair),
-    ("+", Token::Add),
-    ("-", Token::Sub),
-    ("*", Token::Mul),
-    ("/", Token::Div),
-    ("%", Token::Rem),
-];
+impl Lower for ThinModule<Rc<Source>> {
+    type Out = ThinModule<Tokens>;
 
-/// Simple function that lexes a source file into a token stream.
-/// Exposes the functionality of the `Lexer`.
-pub fn lex(source: Rc<Source>) -> Result<Vec<Spanned<Token>>, Syntax> {
-    let mut lexer = Lexer::new(&source);
-    return lexer.all();
+    /// Simple function that lexes a source file into a token stream.
+    /// Exposes the functionality of the `Lexer`.
+    fn lower(self) -> Result<Self::Out, Syntax> {
+        let mut lexer = Lexer::new(&self.repr);
+        return Ok(ThinModule::thin(lexer.all()?));
+    }
 }
 
 /// This represents a lexer object.
@@ -56,16 +42,18 @@ pub struct Lexer {
     source: Rc<Source>,
     /// The current lexing offset.
     offset: usize,
+    /// Closing tokens to match.
+    closing: Vec<(Delim, usize, Span)>,
 }
 
 impl Lexer {
     /// Create a new empty lexer.
     pub fn new(source: &Rc<Source>) -> Lexer {
-        Lexer { source: Rc::clone(source), offset: 0 }
+        Lexer { source: Rc::clone(source), offset: 0, closing: vec![] }
     }
 
     /// Run the lexer, generating the entire token stream.
-    pub fn all(&mut self) -> Result<Vec<Spanned<Token>>, Syntax> {
+    pub fn all(&mut self) -> Result<Tokens, Syntax> {
         let mut tokens = vec![];
 
         while self.remaining().len() != 0 {
@@ -76,15 +64,41 @@ impl Lexer {
             self.offset += Lexer::comment(&self.remaining());
             self.offset += Lexer::multi_comment(&self.remaining());
 
-            // strip trailing whitespace
+            // strip leading whitespace
             self.strip();
+
+            // current lexer location
+            let current_span = Span::point(&self.source, self.offset);
+
+            // check for delimiters
+            // not a fan of continue, but oh well
+            // who is, anyway?
+            if let Some(delim) = Lexer::open_delim(self.remaining()) {
+                self.closing.push((delim, tokens.len(), current_span));
+                self.offset += 1;
+                continue;
+            } else if let Some(delim) = Lexer::close_delim(self.remaining()) {
+                let (back, start) = match self.closing.pop() {
+                    Some((d, back, span)) if d == delim => (back, span),
+                    _ => return Err(Syntax::error(
+                        "Unexpected closing delimiter with no match",
+                        &current_span,
+                    )),
+                };
+
+                let token_group = tokens.split_off(back);
+                let group_span  = Span::combine(&start, &current_span);
+                let group_token = Token::Group { delim, tokens: token_group };
+                tokens.push(Spanned::new(group_token, group_span));
+
+                self.offset += 1;
+                continue;
+            }
 
             // get next token kind, build token
             let (kind, consumed) = match self.step() {
                 Ok(k)  => k,
-                Err(e) => return Err(
-                    Syntax::error(&e, &Span::point(&self.source, self.offset))
-                ),
+                Err(e) => return Err(Syntax::error(&e, &current_span)),
             };
 
             // annotate it
@@ -95,8 +109,14 @@ impl Lexer {
             self.offset += consumed;
         }
 
-        tokens.push(Spanned::new(Token::End, Span::empty()));
+        if !self.closing.is_empty() {
+            return Err(Syntax::error(
+                "Opening delimiter is never closed",
+                &self.closing.pop().unwrap().2,
+            ));
+        }
 
+        tokens.push(Spanned::new(Token::End, Spanned::build(&tokens)));
         return Ok(tokens);
     }
 
@@ -106,24 +126,19 @@ impl Lexer {
 
         let rules: Vec<Box<dyn Fn(&str) -> Result<Bite, String>>> = vec![
             // higher up in order = higher precedence
-            // think 'or' as literal or 'or' as operator
-
-            // static
-            Box::new(Lexer::static_token),
-
-            // variants
             Box::new(Lexer::sep),
-            Box::new(Lexer::boolean),
 
-            // dynamic
+            // words
+            Box::new(Lexer::label),
+            Box::new(Lexer::symbol),
+            Box::new(Lexer::op),
+
+            // data
+            Box::new(Lexer::unit),
+            Box::new(Lexer::boolean),
             Box::new(Lexer::real),
             Box::new(Lexer::integer),
             Box::new(Lexer::string),
-
-            // keep this @ the bottom, lmao
-            Box::new(Lexer::keyword),
-            Box::new(Lexer::label),
-            Box::new(Lexer::symbol),
         ];
 
         // maybe some sort of map reduce?
@@ -141,6 +156,32 @@ impl Lexer {
         }
 
         return best;
+    }
+
+    pub fn open_delim(source: &str) -> Option<Delim> {
+        if let Some(c) = source.chars().next() {
+            Some(match c {
+                '(' => Delim::Paren,
+                '{' => Delim::Curly,
+                '[' => Delim::Square,
+                _   => return None,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn close_delim(source: &str) -> Option<Delim> {
+        if let Some(c) = source.chars().next() {
+            Some(match c {
+                ')' => Delim::Paren,
+                '}' => Delim::Curly,
+                ']' => Delim::Square,
+                _   => return None,
+            })
+        } else {
+            None
+        }
     }
 
     // helpers
@@ -174,7 +215,7 @@ impl Lexer {
 
         match &source.as_bytes()[..literal.len()] {
             s if s == literal.as_bytes() => Ok(literal.len()),
-            _                            => Err(format!("Expected '{}'", source)),
+            _ => Err(format!("Expected '{}'", source)),
         }
     }
 
@@ -199,16 +240,6 @@ impl Lexer {
     }
 
     // token classifiers
-
-    /// Parses a static token, like an operator or a keyword.
-    pub fn static_token(source: &str) -> Result<Bite, String> {
-        for token in STATIC_TOKENS {
-            if let t @ Ok(_) = Lexer::literal(source, token.0, token.1.to_owned()) {
-                return t;
-            }
-        }
-        return Err("Expected a token literal".to_string());
-    }
 
     // TODO: refactor comment and multi-line for doc-comments
 
@@ -260,7 +291,7 @@ impl Lexer {
                 a if a.is_alphanumeric()
                   || "_".contains(a)
                   => { len += a.len_utf8() },
-                _ => { break;   },
+                _ => { break;              },
             }
         }
 
@@ -268,19 +299,20 @@ impl Lexer {
             return Err("Expected an alphanumeric character".to_string());
         }
 
+        let contents = source[0..len].to_string();
         let first = source.chars().next().unwrap();
         match first {
             n if n.is_numeric() => Err(
                 "Can not start with a numeric character".to_string()
             ),
-            s if s.is_uppercase() => Ok((Token::Label, len)), // label
-            _ => Ok((Token::Symbol, len)), // symbol
+            s if s.is_uppercase() => Ok((Token::Label(contents), len)), // label
+            _ => Ok((Token::Iden(contents), len)), // symbol
         }
     }
 
     /// Classifies a symbol (i.e. variable name).
     pub fn symbol(source: &str) -> Result<Bite, String> {
-        if let symbol @ (Token::Symbol, _) = Lexer::identifier(source)? {
+        if let symbol @ (Token::Iden(_), _) = Lexer::identifier(source)? {
             Ok(symbol)
         } else {
             Err("Expected a symbol".to_string())
@@ -290,25 +322,30 @@ impl Lexer {
     /// Classifies a label (i.e. data wrapper).
     /// Must start with an uppercase character.
     pub fn label(source: &str) -> Result<Bite, String> {
-        if let label @ (Token::Label, _) = Lexer::identifier(source)? {
+        if let label @ (Token::Label(_), _) = Lexer::identifier(source)? {
             Ok(label)
         } else {
             Err("Expected a Label".to_string())
         }
     }
 
-    /// Classifies a pseudokeyword, used in syntax macros.
-    /// Must start with a single quote `'`.
-    pub fn keyword(source: &str) -> Result<Bite, String> {
+    pub fn op(source: &str) -> Result<Bite, String> {
         let mut len = 0;
-        len += Lexer::expect(&source, "'")?;
 
-        if let (Token::Symbol, l) = Lexer::identifier(&source[len..])? {
-            let keyword = source[len..len+l].to_string();
-            Ok((Token::Keyword(keyword), len + l))
-        } else {
-            Err("Expected a pseudokeyword".to_string())
+        for char in source.chars() {
+            match char {
+                a if "!#$%&*+,-./:<=>?@\\^`|~".contains(a)
+                  => { len += a.len_utf8() },
+                _ => { break;              },
+            }
         }
+
+        if len == 0 {
+            return Err("Expected an operator".to_string());
+        }
+
+        let contents = source[0..len].to_string();
+        Ok((Token::Op(contents), len))
     }
 
     /// Matches a number with a decimal point.
@@ -327,7 +364,7 @@ impl Lexer {
             Err(_) => panic!("Could not convert source to supposed real")
         };
 
-        return Ok((Token::Number(Data::Real(number)), len));
+        return Ok((Token::Data(Data::Real(number)), len));
     }
 
     pub fn integer(source: &str) -> Result<Bite, String> {
@@ -340,7 +377,7 @@ impl Lexer {
         };
 
         // TODO: introduce new token?
-        return Ok((Token::Number(Data::Integer(number)), len));
+        return Ok((Token::Data(Data::Integer(number)), len));
     }
 
     /// Matches a string, converting escapes.
@@ -370,7 +407,7 @@ impl Lexer {
             } else {
                 match c {
                     '\\' => escape = true,
-                    '\"' => return Ok((Token::String(Data::String(string)), len)),
+                    '\"' => return Ok((Token::Data(Data::String(string)), len)),
                     c    => string.push(c),
                 }
             }
@@ -379,6 +416,12 @@ impl Lexer {
         return Err("Unexpected EOF while parsing string literal".to_string());
     }
 
+    /// Matches an empty tuple
+    pub fn unit(source: &str) -> Result<Bite, String> {
+        Lexer::literal(source, "()", Token::Data(Data::Unit))
+    }
+
+    // TODO: booleans implemented in std
     /// Matches a literal boolean.
     pub fn boolean(source: &str) -> Result<Bite, String> {
         for (lit, val) in [
@@ -386,7 +429,7 @@ impl Lexer {
             ("false", false),
         ].iter() {
             if let x @ Ok(_) = Lexer::literal(
-                source, lit, Token::Boolean(Data::Boolean(*val))
+                source, lit, Token::Data(Data::Boolean(*val))
             ) { return x; }
         }
 
@@ -424,181 +467,180 @@ impl Lexer {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::common::data::Data;
-
-    // NOTE: lexing individual tokens is tested in pipeline::token
-
-    #[test]
-    fn empty() {
-        // no source code? no tokens!
-        let result = lex(Source::source(""));
-        let target: Result<Vec<Spanned<Token>>, Syntax> =
-            Ok(vec![Spanned::new(Token::End, Span::empty())]);
-
-        assert_eq!(result, target);
-    }
-
-    #[test]
-    fn assignment() {
-        let source = Source::source("heck = true");
-
-        let result = vec![
-            Spanned::new(Token::Symbol,                       Span::new(&source, 0, 4)),
-            Spanned::new(Token::Assign,                       Span::new(&source, 5, 1)),
-            Spanned::new(Token::Boolean(Data::Boolean(true)), Span::new(&source, 7, 4)),
-            Spanned::new(Token::End,                          Span::empty()),
-        ];
-
-        assert_eq!(lex(source), Ok(result));
-    }
-
-    #[test]
-    fn whitespace() {
-        let source = Source::source("  true  ;  ");
-
-        let result = vec![
-            Spanned::new(Token::Boolean(Data::Boolean(true)), Span::new(&source, 2, 4)),
-            Spanned::new(Token::Sep,                          Span::new(&source, 8, 3)),
-            Spanned::new(Token::End,                          Span::empty()),
-
-        ];
-
-        assert_eq!(lex(source), Ok(result));
-    }
-
-    #[test]
-    fn block() {
-        let source = Source::source("{\n\thello = true\n\thello\n}");
-
-        // TODO: finish test
-
-        let result = vec![
-            Spanned::new(Token::OpenBracket,                  Span::new(&source, 0, 1)),
-            Spanned::new(Token::Sep,                          Span::new(&source, 1, 2)),
-            Spanned::new(Token::Symbol,                       Span::new(&source, 3, 5)),
-            Spanned::new(Token::Assign,                       Span::new(&source,  9, 1)),
-            Spanned::new(Token::Boolean(Data::Boolean(true)), Span::new(&source, 11, 4)),
-            Spanned::new(Token::Sep,                          Span::new(&source, 15, 2)),
-            Spanned::new(Token::Symbol,                       Span::new(&source, 17, 5)),
-            Spanned::new(Token::Sep,                          Span::new(&source, 22, 1)),
-            Spanned::new(Token::CloseBracket,                 Span::new(&source, 23, 1)),
-            Spanned::new(Token::End,                          Span::empty()),
-        ];
-
-        assert_eq!(lex(source), Ok(result));
-    }
-
-    #[test]
-    fn function() {
-        let source = Source::source("identity = x -> x\nidentity (identity \"heck\")");
-        let result = vec![
-            Spanned::new(Token::Symbol,                                   Span::new(&source, 0, 8)),
-            Spanned::new(Token::Assign,                                   Span::new(&source, 9, 1)),
-            Spanned::new(Token::Symbol,                                   Span::new(&source, 11, 1)),
-            Spanned::new(Token::Lambda,                                   Span::new(&source, 13, 2)),
-            Spanned::new(Token::Symbol,                                   Span::new(&source, 16, 1)),
-            Spanned::new(Token::Sep,                                      Span::new(&source, 17, 1)),
-            Spanned::new(Token::Symbol,                                   Span::new(&source, 18, 8)),
-            Spanned::new(Token::OpenParen,                                Span::new(&source, 27, 1)),
-            Spanned::new(Token::Symbol,                                   Span::new(&source, 28, 8)),
-            Spanned::new(Token::String(Data::String("heck".to_string())), Span::new(&source, 37, 6)),
-            Spanned::new(Token::CloseParen,                               Span::new(&source, 43, 1)),
-            Spanned::new(Token::End,                          Span::empty()),
-        ];
-
-        assert_eq!(lex(source), Ok(result));
-    }
-
-    // helper function for the following tests
-
-    fn test_literal(literal: &str, token: Token, length: usize) -> bool {
-        let result = Lexer::new(&Source::source(literal)).step();
-
-        match result {
-            Ok(v) => v == (token, length),
-            Err(_) => false
-        }
-    }
-
-    // each case tests the detection of a specific token type
-
-    #[test]
-    fn boolean() {
-        if !test_literal("true",  Token::Boolean(Data::Boolean(true)), 4)  { panic!() }
-        if !test_literal("false", Token::Boolean(Data::Boolean(false)), 5) { panic!() }
-    }
-
-    #[test]
-    fn assign() {
-        if !test_literal("=", Token::Assign, 1) { panic!() }
-    }
-
-    #[test]
-    fn symbol() {
-        if !test_literal("orchard", Token::Symbol, 7) { panic!() }
-    }
-
-    #[test]
-    fn sep() {
-        if !test_literal(
-            "\n  heck",
-            Token::Sep,
-            3,
-        ) { panic!() }
-
-        if !test_literal(
-            ";\n ; heck",
-            Token::Sep,
-            5,
-        ) { panic!() }
-    }
-
-    #[test]
-    fn real() {
-        if !test_literal(
-            "2.0",
-            Token::Number(Data::Real(2.0)),
-            3,
-        ) { panic!() }
-
-        if !test_literal(
-            "210938.2221",
-            Token::Number(Data::Real(210938.2221)),
-            11,
-        ) { panic!() }
-    }
-
-    #[test]
-    fn string() {
-        let source = "\"heck\"";
-        if !test_literal(
-            source,
-            Token::String(Data::String("heck".to_string())),
-            source.len(),
-        ) { panic!() }
-
-        let escape = "\"I said, \\\"Hello, world!\\\" didn't I?\"";
-        if !test_literal(
-            escape,
-            Token::String(Data::String("I said, \"Hello, world!\" didn't I?".to_string())),
-            escape.len(),
-        ) { panic!() }
-
-        let unicode = "\"Yo 👋! Ünícode µ works just fine 🚩! うん、気持ちいい！\"";
-        if !test_literal(
-            unicode,
-            Token::String(Data::String("Yo 👋! Ünícode µ works just fine 🚩! うん、気持ちいい！".to_string())),
-            unicode.len(),
-        ) { panic!() }
-    }
-
-    #[test]
-    fn comma() {
-        let source = Source::source("heck\\ man");
-        let tokens = lex(source.clone());
-        assert_eq!(tokens, Err(Syntax::error("Unexpected token", &Span::new(&source, 4, 0))));
-    }
-}
+// #[cfg(test)]
+// mod test {
+//     use super::*;
+//     use crate::common::data::Data;
+//
+//     // NOTE: lexing individual tokens is tested in pipeline::token
+//
+//     #[test]
+//     fn empty() {
+//         // no source code? no tokens!
+//         let result = ThinModule::thin(Source::source("")).lower();
+//         let target: Result<ThinModule<Tokens>, Syntax> =
+//             Ok(ThinModule::thin(vec![Spanned::new(Token::End, Span::Empty)]));
+//
+//         assert_eq!(result, target);
+//     }
+//
+//     #[test]
+//     fn assignment() {
+//         let source = Source::source("heck = true");
+//
+//         let result = vec![
+//             Spanned::new(Token::Symbol,                       Span::new(&source, 0, 4)),
+//             Spanned::new(Token::Assign,                       Span::new(&source, 5, 1)),
+//             Spanned::new(Token::Boolean(Data::Boolean(true)), Span::new(&source, 7, 4)),
+//             Spanned::new(Token::End,                          Span::Empty),
+//         ];
+//
+//         assert_eq!(ThinModule::thin(source).lower(), Ok(ThinModule::thin(result)));
+//     }
+//
+//     #[test]
+//     fn whitespace() {
+//         let source = Source::source("  true  ;  ");
+//
+//         let result = vec![
+//             Spanned::new(Token::Boolean(Data::Boolean(true)), Span::new(&source, 2, 4)),
+//             Spanned::new(Token::Sep,                          Span::new(&source, 8, 3)),
+//             Spanned::new(Token::End,                          Span::Empty),
+//
+//         ];
+//
+//         assert_eq!(ThinModule::thin(source).lower(), Ok(ThinModule::thin(result)));
+//     }
+//
+//     #[test]
+//     fn block() {
+//         let source = Source::source("{\n\thello = true\n\thello\n}");
+//
+//         let result = vec![
+//             Spanned::new(Token::OpenBracket,                  Span::new(&source, 0, 1)),
+//             Spanned::new(Token::Sep,                          Span::new(&source, 1, 2)),
+//             Spanned::new(Token::Symbol,                       Span::new(&source, 3, 5)),
+//             Spanned::new(Token::Assign,                       Span::new(&source,  9, 1)),
+//             Spanned::new(Token::Boolean(Data::Boolean(true)), Span::new(&source, 11, 4)),
+//             Spanned::new(Token::Sep,                          Span::new(&source, 15, 2)),
+//             Spanned::new(Token::Symbol,                       Span::new(&source, 17, 5)),
+//             Spanned::new(Token::Sep,                          Span::new(&source, 22, 1)),
+//             Spanned::new(Token::CloseBracket,                 Span::new(&source, 23, 1)),
+//             Spanned::new(Token::End,                          Span::Empty),
+//         ];
+//
+//         assert_eq!(ThinModule::thin(source).lower(), Ok(ThinModule::thin(result)));
+//     }
+//
+//     #[test]
+//     fn function() {
+//         let source = Source::source("identity = x -> x\nidentity (identity \"heck\")");
+//
+//         let result = vec![
+//             Spanned::new(Token::Symbol,                                   Span::new(&source, 0, 8)),
+//             Spanned::new(Token::Assign,                                   Span::new(&source, 9, 1)),
+//             Spanned::new(Token::Symbol,                                   Span::new(&source, 11, 1)),
+//             Spanned::new(Token::Lambda,                                   Span::new(&source, 13, 2)),
+//             Spanned::new(Token::Symbol,                                   Span::new(&source, 16, 1)),
+//             Spanned::new(Token::Sep,                                      Span::new(&source, 17, 1)),
+//             Spanned::new(Token::Symbol,                                   Span::new(&source, 18, 8)),
+//             Spanned::new(Token::OpenParen,                                Span::new(&source, 27, 1)),
+//             Spanned::new(Token::Symbol,                                   Span::new(&source, 28, 8)),
+//             Spanned::new(Token::String(Data::String("heck".to_string())), Span::new(&source, 37, 6)),
+//             Spanned::new(Token::CloseParen,                               Span::new(&source, 43, 1)),
+//             Spanned::new(Token::End,                                      Span::Empty),
+//         ];
+//
+//         assert_eq!(ThinModule::thin(source).lower(), Ok(ThinModule::thin(result)));
+//     }
+//
+//     // helper function for the following tests
+//
+//     fn test_literal(literal: &str, token: Token, length: usize) -> bool {
+//         let result = Lexer::new(&Source::source(literal)).step();
+//
+//         match result {
+//             Ok(v) => v == (token, length),
+//             Err(_) => false
+//         }
+//     }
+//
+//     // each case tests the detection of a specific token type
+//
+//     #[test]
+//     fn boolean() {
+//         if !test_literal("true",  Token::Boolean(Data::Boolean(true)), 4)  { panic!() }
+//         if !test_literal("false", Token::Boolean(Data::Boolean(false)), 5) { panic!() }
+//     }
+//
+//     #[test]
+//     fn assign() {
+//         if !test_literal("=", Token::Assign, 1) { panic!() }
+//     }
+//
+//     #[test]
+//     fn symbol() {
+//         if !test_literal("orchard", Token::Symbol, 7) { panic!() }
+//     }
+//
+//     #[test]
+//     fn sep() {
+//         if !test_literal(
+//             "\n  heck",
+//             Token::Sep,
+//             3,
+//         ) { panic!() }
+//
+//         if !test_literal(
+//             ";\n ; heck",
+//             Token::Sep,
+//             5,
+//         ) { panic!() }
+//     }
+//
+//     #[test]
+//     fn real() {
+//         if !test_literal(
+//             "2.0",
+//             Token::Number(Data::Real(2.0)),
+//             3,
+//         ) { panic!() }
+//
+//         if !test_literal(
+//             "210938.2221",
+//             Token::Number(Data::Real(210938.2221)),
+//             11,
+//         ) { panic!() }
+//     }
+//
+//     #[test]
+//     fn string() {
+//         let source = "\"heck\"";
+//         if !test_literal(
+//             source,
+//             Token::String(Data::String("heck".to_string())),
+//             source.len(),
+//         ) { panic!() }
+//
+//         let escape = "\"I said, \\\"Hello, world!\\\" didn't I?\"";
+//         if !test_literal(
+//             escape,
+//             Token::String(Data::String("I said, \"Hello, world!\" didn't I?".to_string())),
+//             escape.len(),
+//         ) { panic!() }
+//
+//         let unicode = "\"Yo 👋! Ünícode µ works just fine 🚩! うん、気持ちいい！\"";
+//         if !test_literal(
+//             unicode,
+//             Token::String(Data::String("Yo 👋! Ünícode µ works just fine 🚩! うん、気持ちいい！".to_string())),
+//             unicode.len(),
+//         ) { panic!() }
+//     }
+//
+//     #[test]
+//     fn comma() {
+//         let source = Source::source("heck\\ man");
+//         let tokens = ThinModule::thin(source.clone()).lower();
+//         assert_eq!(tokens, Err(Syntax::error("Unexpected token", &Span::new(&source, 4, 0))));
+//     }
+// }

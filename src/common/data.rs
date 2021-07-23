@@ -18,6 +18,8 @@ use crate::common::{
 /// Built-in Passerine datatypes.
 #[derive(Clone, PartialEq)]
 pub enum Data {
+    // TODO: make heap data immutable
+    // TODO: CoW
     /// Data on the heap.
     Heaped(Rc<RefCell<Data>>),
     /// Uninitialized data.
@@ -38,12 +40,12 @@ pub enum Data {
     /// Some bytecode with a context that can be run.
     Closure(Box<Closure>),
 
-    // TODO: rework how labels and tags work
+    // TODO: just remove Kind
     /// `Kind` is the base component of an unconstructed label
-    Kind(String),
+    Kind(usize),
     /// A Label is similar to a type, and wraps some data.
     /// in the future labels will have associated namespaces.
-    Label(Box<String>, Box<Data>),
+    Label(usize, Box<Data>),
 
     // TODO: equivalence between Unit and Tuple(vec![])?
 
@@ -69,13 +71,13 @@ impl Display for Data {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         match self {
             Data::Heaped(_)   => unreachable!("Can not display heaped data"),
-            Data::NotInit     => unreachable!("found uninitialized data on top of stack"),
+            Data::NotInit     => unreachable!("Can not display uninitialized data"),
             Data::Real(n)     => write!(f, "{}", n),
             Data::Integer(n)  => write!(f, "{}", n),
             Data::Boolean(b)  => write!(f, "{}", if *b { "true" } else { "false" }),
             Data::String(s)   => write!(f, "{}", s),
             Data::Lambda(_)   => unreachable!("Can not display naked functions"),
-            Data::Closure(c)  => write!(f, "Function ~ {}", c.id),
+            Data::Closure(_)  => write!(f, "Function"),
             Data::Kind(_)     => unreachable!("Can not display naked labels"),
             Data::Label(n, v) => write!(f, "{} {}", n, v),
             Data::Unit        => write!(f, "()"),
@@ -102,7 +104,7 @@ impl Debug for Data {
             Data::Boolean(b)  => write!(f, "Boolean({:?})", b),
             Data::String(s)   => write!(f, "String({:?})", s),
             Data::Lambda(_)   => write!(f, "Function(...)"),
-            Data::Closure(c)  => write!(f, "Closure({})", c.id),
+            Data::Closure(_c) => write!(f, "Closure(...)"), // TODO: how to differentiate?
             Data::Kind(n)     => write!(f, "Kind({})", n),
             Data::Label(n, v) => write!(f, "Label({}, {:?})", n, v),
             Data::Unit        => write!(f, "Unit"),

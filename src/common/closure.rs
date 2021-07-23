@@ -4,12 +4,9 @@ use std::{
 };
 
 use crate::common::{
-    stamp::stamp,
     lambda::Lambda,
     data::Data,
 };
-
-// TODO: take a reference to lambda?
 
 /// Wraps a `Lambda` with some scope context.
 /// Each closure is unique when constructed,
@@ -17,7 +14,6 @@ use crate::common::{
 /// It holds a set of references to variables it captures.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Closure {
-    pub id: String,
     pub lambda: Rc<Lambda>,
     pub captures: Vec<Rc<RefCell<Data>>>,
 }
@@ -27,7 +23,6 @@ impl Closure {
     /// This closure has no captured variables when constructed.
     pub fn wrap(lambda: Rc<Lambda>) -> Closure {
         Closure {
-            id: stamp(0),
             lambda,
             captures: vec![],
         }

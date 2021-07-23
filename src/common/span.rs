@@ -17,9 +17,9 @@ use crate::common::source::Source;
 /// to be used during error reporting.
 #[derive(Clone, Eq, PartialEq)]
 pub struct Span {
-    pub source: Option<Rc<Source>>,
-    pub offset: usize,
-    pub length: usize,
+    source: Rc<Source>,
+    offset: usize,
+    length: usize,
 }
 
 impl Span {
@@ -27,41 +27,17 @@ impl Span {
     /// All `Span`s have access to the `Source` from whence they came,
     /// So they can't be misinterpreted or miscombined.
     pub fn new(source: &Rc<Source>, offset: usize, length: usize) -> Span {
-        Span { source: Some(Rc::clone(source)), offset, length }
+        Span { source: Rc::clone(source), offset, length }
     }
 
     /// A `Span` that points at a specific point in the source.
     pub fn point(source: &Rc<Source>, offset: usize) -> Span {
-        // NOTE: maybe it should be 0?
-        Span { source: Some(Rc::clone(source)), offset, length: 0 }
-    }
-
-    /// Create a new empty `Span`.
-    /// An empty `Span` has only a source,
-    /// if combined with another `Span`, the resulting `Span` will just be the other.
-    pub fn empty() -> Span {
-        Span { source: None, offset: 0, length: usize::MAX }
-    }
-
-    /// Checks if a `Span` is empty.
-    pub fn is_empty(&self) -> bool {
-        self.source == None
+        Span { source: Rc::clone(source), offset, length: 1 }
     }
 
     /// Return the index of the end of the `Span`.
     pub fn end(&self) -> usize {
         self.offset + self.length
-    }
-
-    /// Compares two Spans.
-    /// Returns true if this span starts the latest
-    /// or is the longest in the case of a tie
-    /// but false there is a total tie
-    /// or otherwise.
-    pub fn later_than(&self, other: &Span) -> bool {
-        self.offset > other.offset
-           || (self.offset == other.offset
-              && self.end() > other.end())
     }
 
     /// Creates a new `Span` which spans the space of the previous two.
@@ -72,27 +48,22 @@ impl Span {
     /// ^^^^^^^^^^^^^      | combined
     /// ```
     pub fn combine(a: &Span, b: &Span) -> Span {
-        if a.is_empty() { return b.clone(); }
-        if b.is_empty() { return a.clone(); }
-
         if a.source != b.source {
-            panic!("Can't combine two Spans with separate sources")
+            panic!("Can't combine two Spans with separate sources");
         }
 
         let offset = a.offset.min(b.offset);
         let end    = a.end().max(b.end());
         let length = end - offset;
 
-        // `a` should not be empty at this point
-        return Span::new(&a.source.as_ref().unwrap(), offset, length);
+        return Span::new(&a.source, offset, length);
     }
 
     /// Combines a set of `Span`s (think fold-left over `Span::combine`).
+    /// If the vector of spans passed in is empty, this method panics.
     pub fn join(mut spans: Vec<Span>) -> Span {
-        let mut combined = match spans.pop() {
-            Some(span) => span,
-            None       => return Span::empty(),
-        };
+        let mut combined = spans.pop()
+            .expect("Expected at least one span");
 
         while let Some(span) = spans.pop() {
             combined = Span::combine(&combined, &span)
@@ -106,43 +77,56 @@ impl Span {
     /// so if the `Span` is along an invalid byte boundary or
     /// is empty, the program will panic.
     pub fn contents(&self) -> String {
-        if self.is_empty() { panic!("An empty span does not have any contents") }
-        self.source.as_ref().unwrap().contents[self.offset..(self.end())].to_string()
+        self.source.as_ref().contents[self.offset..self.end()].to_string()
     }
 
-    // Used by fmt::Display:
-
-    // NOTE: once split_inclusive is included in rust's stdlib,
-    // just replace this method with the std version.
-    /// Splits a string by the newline character ('\n') into a Vector of string slices.
-    /// Includes the trailing newline in each slice.
-    fn lines_newline(string: &str) -> Vec<String> {
-        return string.split("\n").map(|l| l.to_string() + "\n").collect();
+    pub fn lines(&self) -> Vec<String> {
+        let full_source = &self.source.as_ref().contents;
+        let lines: Vec<_> = full_source.split("\n").collect();
+        let start_line = self.line(self.offset);
+        let end_line = self.line(self.end());
+        let slice = lines[start_line..=end_line]
+            .iter().map(|s| s.to_string()).collect();
+        println!("{:#?}", slice);
+        return slice;
     }
 
-    /// Split a string by newline (`'\n'`), but do include the newline in each splice.
-    fn lines(string: &str) -> Vec<String> {
-        return string.split("\n").map(|l| l.to_string()).collect();
+    pub fn path(&self) -> String {
+        self.source.clone().path.to_string_lossy().to_string()
     }
 
-    /// Returns the start and end lines and columns of the `Span` if the `Span` is not empty.
-    fn line_index(string: &str, index: usize) -> Option<(usize, usize)> {
-        let lines = Span::lines_newline(&string[..index]);
-        let line = lines.len() - 1;
-        let col = lines.last()?.chars().count() - 1;
+    pub fn line(&self, index: usize) -> usize {
+        let lines = &self.source.contents[..index]
+            .split_inclusive("\n").count();
+        println!("{:?}", index);
+        return lines - 1;
+    }
 
-        return Some((line, col));
+    pub fn col(&self, index: usize) -> usize {
+        let lines = &self.source.contents[..index]
+            .split_inclusive("\n").last().unwrap()
+            .chars().count();
+        return *lines;
+    }
+
+    pub fn format(&self) -> FormattedSpan {
+        FormattedSpan {
+            path:      self.path(),
+            start:     self.line(self.offset),
+            lines:     self.lines(),
+            start_col: self.col(self.offset),
+            end_col:   self.col(self.end()),
+        }
     }
 }
 
 impl Debug for Span {
-    // TODO: use the field, etc. constructor.
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if !self.is_empty() {
-            write!(f, "Span {{ {:?}, ({}, {}) }}", self.contents(), self.offset, self.length)
-        } else {
-            write!(f, "Span {{ Empty }}")
-        }
+        f.debug_struct("Span")
+            .field("contents", &self.contents())
+            .field("start", &self.offset)
+            .field("end", &self.end())
+            .finish()
     }
 }
 
@@ -163,70 +147,66 @@ impl Display for Span {
     /// 15 > }
     /// ```
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        if self.is_empty() {
-            panic!("Can't display the section corresponding with an empty Span")
-        }
+        writeln!(f, "{}", self.format())
+    }
+}
 
-        let full_source = &self.source.as_ref().unwrap().contents;
-        let lines = Span::lines(&full_source);
+/// Represents a formatted span, ready to be displayed.
+/// Contains information about where the span is from,
+/// and where in the text it starts and ends
+/// relative to the lines in the source.
+pub struct FormattedSpan {
+    pub path:      String,
+    pub start:     usize,
+    pub lines:     Vec<String>,
+    pub start_col: usize,
+    pub end_col:   usize,
+}
 
-        let (start_line, start_col) = match Span::line_index(full_source, self.offset) {
-            Some(li) => li,
-            None     => unreachable!(),
-        };
-        let (end_line, _end_col) = match Span::line_index(full_source, self.end()) {
-            Some(li) => li,
-            None     => unreachable!(),
-        };
+impl FormattedSpan {
+    pub fn is_multiline(&self) -> bool {
+        self.lines.len() != 1
+    }
 
-        let readable_start_line = (start_line + 1).to_string();
-        let readable_end_line   = (end_line   + 1).to_string();
-        let readable_start_col  = (start_col  + 1).to_string();
-        let padding = readable_end_line.len();
+    pub fn end(&self) -> usize {
+        (self.start - 1) + self.lines.len()
+    }
 
-        let location  = format!(
-            "In {}:{}:{}",
-            self.source.clone().unwrap()
-                .path.to_string_lossy(),
-            readable_start_line,
-            readable_start_col
-        );
+    pub fn gutter_padding(&self) -> usize {
+        self.start.to_string().len()
+    }
 
-        let separator = format!(" {} |", " ".repeat(padding));
-
-        if start_line == end_line {
-            let l = &lines[end_line];
-
-            let line = format!(" {} | {}", readable_end_line, l);
-            let span = format!(
-                " {} | {}{}",
-                " ".repeat(padding),
-                " ".repeat(start_col),
-                "^".repeat(self.length.max(1)),
-            );
-
-            writeln!(f, "{}", location)?;
-            writeln!(f, "{}", separator)?;
-            writeln!(f, "{}", line)?;
-            writeln!(f, "{}", span)?;
-            writeln!(f, "{}", separator)
+    /// If a single line span, returns the number of carrots between cols.
+    pub fn carrots(&self) -> Option<usize> {
+        if self.lines.len() == 1 {
+            Some(self.end_col - self.start_col)
         } else {
-            let formatted = lines[start_line..=end_line]
-                .iter()
-                .enumerate()
-                .map(|(i, l)| {
-                    let readable_line_no = (start_line + i + 1).to_string();
-                    let partial_padding = " ".repeat(padding - readable_line_no.len());
-                    format!(" {}{} > {}", partial_padding, readable_line_no, l)
-                })
-                .collect::<Vec<String>>()
-                .join("\n");
-
-            writeln!(f, "{}", location)?;
-            writeln!(f, "{}", separator)?;
-            writeln!(f, "{}", formatted)?;
-            writeln!(f, "{}", separator)
+            None
         }
+    }
+}
+
+impl Display for FormattedSpan {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        writeln!(f, "In {}:{}:{}", self.path, self.start + 1, self.start_col + 1)?;
+        writeln!(f, "{} │", " ".repeat(self.gutter_padding()))?;
+
+        if !self.is_multiline() {
+            writeln!(f, "{} │ {}", self.start + 1, self.lines[0])?;
+            writeln!(f, "{} │ {}{}",
+                " ".repeat(self.gutter_padding()),
+                " ".repeat(self.start_col),
+                "^".repeat(self.carrots().unwrap()),
+            )?;
+        } else {
+            for (index, line) in self.lines.iter().enumerate() {
+                let line_no = (self.start + index).to_string();
+                let padding = " ".repeat(self.gutter_padding() - line_no.len());
+                writeln!(f, "{}{} > {}", line_no, padding, line)?;
+            }
+        }
+
+        Ok(())
     }
 }
 
